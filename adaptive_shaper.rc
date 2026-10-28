@@ -1,0 +1,17 @@
+#!/bin/sh
+# PROVIDE: adaptive_shaper
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="adaptive_shaper"
+rcvar="adaptive_shaper_enable"
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-f -r -P ${pidfile} -t ${name} /usr/local/bin/python3 /usr/local/sbin/adaptive-shaper.py"
+
+load_rc_config $name
+: ${adaptive_shaper_enable:=NO}
+
+run_rc_command "$1"

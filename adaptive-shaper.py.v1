@@ -1,0 +1,289 @@
+#!/usr/local/bin/python3
+"""adaptive-shaper: cake-autorate-style controller for the OPNsense download pipe.
+
+Modulates dummynet pipe DOWN_PIPE bandwidth at runtime (dnctl) so the fq_codel
+queue stays the bottleneck even as Comcast's delivered DOCSIS rate swings.
+Cuts on latency-under-load, grows when clean, reverts toward BASE when idle.
+Runtime dnctl bw reconfig preserves the fq_codel sched (verified 2026-08-13).
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+# ---- tunables -------------------------------------------------------------
+DOWN_PIPE = 2                 # WANDown
+IFACE = "igc1"                # WAN
+FLOOR_MBIT = 1200
+CEIL_MBIT = 2100
+BASE_MBIT = 1800              # idle reversion target / startup rate
+RTT_LO_MS = 15.0              # below this while loaded -> grow
+RTT_HI_MS = 40.0              # above this while loaded -> cut
+CUT_FACTOR = 0.85
+GROW_MBIT = 20                # per clean loaded tick
+LOAD_FRAC = 0.60              # rx > this * rate  -> "loaded"
+IDLE_FRAC = 0.20              # rx < this * rate  -> "idle" (baseline updates)
+CUT_REFRACTORY_S = 3.0
+IDLE_REVERT_AFTER_S = 60.0    # idle this long before stepping toward BASE
+IDLE_REVERT_STEP = 50         # Mbit per tick while reverting
+DRIFT_CHECK_S = 30.0
+REFLECTORS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "9.9.9.9"]
+TICK_S = 1.0
+HEARTBEAT_S = 300.0
+
+LOG = "/var/log/adaptive_shaper.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+STATUS = "/var/run/adaptive_shaper.status"
+TELEM = "/var/log/adaptive_shaper_telemetry.csv"
+TELEM_MAX_BYTES = 25 * 1024 * 1024   # rotate to .0, keep one
+TELEM_IDLE_EVERY = 10                # decimate idle ticks to 1-in-10
+# ---------------------------------------------------------------------------
+
+running = True
+
+
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def log(msg):
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > LOG_MAX_BYTES:
+            os.rename(LOG, LOG + ".0")
+        with open(LOG, "a") as f:
+            f.write("%s %s\n" % (now_iso(), msg))
+    except OSError:
+        pass
+
+
+def run(cmd, timeout=3):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+_telem_f = None
+
+
+def telem(rate, rx, rtt, host, delta, loaded):
+    """Per-tick CSV: full rate when loaded/elevated, decimated when idle."""
+    global _telem_f
+    try:
+        if _telem_f is None:
+            fresh = not os.path.exists(TELEM)
+            _telem_f = open(TELEM, "a", buffering=1)
+            if fresh:
+                _telem_f.write("ts,rate_mbit,rx_mbps,rtt_ms,reflector,delta_ms,loaded\n")
+        _telem_f.write("%s,%d,%.1f,%s,%s,%s,%d\n"
+                       % (now_iso(), rate, rx,
+                          "%.1f" % rtt if rtt is not None else "",
+                          host,
+                          "%.1f" % delta if delta is not None else "",
+                          1 if loaded else 0))
+        if _telem_f.tell() > TELEM_MAX_BYTES:
+            _telem_f.close()
+            _telem_f = None
+            os.rename(TELEM, TELEM + ".0")
+    except OSError:
+        _telem_f = None
+
+
+def pipe_bw_mbit():
+    """Current bw of DOWN_PIPE per dnctl, in Mbit; None if pipe absent."""
+    try:
+        out = run(["/sbin/dnctl", "pipe", "show"]).stdout
+    except Exception:
+        return None
+    m = re.search(r"^0*%d:\s+([\d.]+)\s+([GM])bit/s" % DOWN_PIPE, out, re.M)
+    if not m:
+        return None
+    val = float(m.group(1))
+    return val * 1000.0 if m.group(2) == "G" else val
+
+
+def sched_is_fq_codel():
+    try:
+        out = run(["/sbin/dnctl", "sched", "show"]).stdout
+    except Exception:
+        return False
+    return bool(re.search(r"sched %d type FQ_CODEL" % DOWN_PIPE, out))
+
+
+def set_bw(mbit):
+    mbit = int(round(mbit))
+    r = run(["/sbin/dnctl", "pipe", str(DOWN_PIPE), "config",
+             "bw", "%dMbit/s" % mbit])
+    if r.returncode != 0:
+        log("ERROR dnctl set %d: %s" % (mbit, r.stderr.strip()))
+        return False
+    return True
+
+
+def wan_ibytes():
+    """Ibytes from the Link# row for IFACE; None on parse failure."""
+    try:
+        out = run(["/usr/bin/netstat", "-ibn", "-I", IFACE]).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if "<Link#" in line:
+            parts = line.split()
+            try:
+                return int(parts[7])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def ping_ms(host):
+    """RTT in ms, or None on loss/timeout."""
+    try:
+        r = run(["/sbin/ping", "-c", "1", "-W", "600", host], timeout=2.5)
+    except subprocess.TimeoutExpired:
+        return None
+    m = re.search(r"time=([\d.]+)\s*ms", r.stdout)
+    return float(m.group(1)) if m else None
+
+
+def on_term(signum, frame):
+    global running
+    running = False
+
+
+def main():
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+
+    log("startup: waiting for pipe %d with FQ_CODEL sched" % DOWN_PIPE)
+    while running and not (pipe_bw_mbit() is not None and sched_is_fq_codel()):
+        time.sleep(5)
+    if not running:
+        return
+
+    rate = float(BASE_MBIT)
+    set_bw(rate)
+    log("startup: took control, rate=%d (floor=%d ceil=%d base=%d)"
+        % (rate, FLOOR_MBIT, CEIL_MBIT, BASE_MBIT))
+
+    baselines = {}            # reflector -> EWMA baseline ms
+    refl_i = 0
+    prev_bytes = wan_ibytes()
+    prev_t = time.monotonic()
+    rx_ewma = 0.0
+    last_cut_t = 0.0
+    loaded_last_t = time.monotonic()
+    last_drift_t = time.monotonic()
+    last_heartbeat_t = 0.0
+    last_logged_rate = rate
+    consec_loss = 0
+    tick = 0
+
+    while running:
+        t0 = time.monotonic()
+        tick += 1
+
+        # -- rx rate from Ibytes delta
+        b = wan_ibytes()
+        if b is not None and prev_bytes is not None and b >= prev_bytes:
+            dt = t0 - prev_t
+            if dt > 0:
+                mbps = (b - prev_bytes) * 8.0 / dt / 1e6
+                rx_ewma = 0.5 * rx_ewma + 0.5 * mbps
+        prev_bytes = b if b is not None else prev_bytes
+        prev_t = t0
+
+        loaded = rx_ewma > LOAD_FRAC * rate
+        idle = rx_ewma < IDLE_FRAC * rate
+        if loaded:
+            loaded_last_t = t0
+
+        # -- probe
+        host = REFLECTORS[refl_i % len(REFLECTORS)]
+        refl_i += 1
+        rtt = ping_ms(host)
+
+        delta = None
+        if rtt is None:
+            consec_loss += 1
+        else:
+            consec_loss = 0
+            base = baselines.get(host)
+            if base is None:
+                baselines[host] = rtt
+                base = rtt
+            else:
+                # asymmetric EWMA: chase minima fast, inflate slowly
+                a = 0.4 if rtt < base else (0.02 if idle else 0.0)
+                base = base + a * (rtt - base)
+                baselines[host] = base
+            delta = rtt - base
+
+        # -- control law
+        if loaded:
+            congested = (delta is not None and delta > RTT_HI_MS) or consec_loss >= 2
+            clean = delta is not None and delta < RTT_LO_MS
+            if congested and (t0 - last_cut_t) > CUT_REFRACTORY_S:
+                new = max(FLOOR_MBIT, rate * CUT_FACTOR)
+                if new < rate:
+                    rate = new
+                    set_bw(rate)
+                    last_cut_t = t0
+                    log("CUT rate=%d rtt=%s base=%.1f delta=%s rx=%.0f refl=%s"
+                        % (rate, "%.1f" % rtt if rtt else "loss",
+                           baselines.get(host, 0.0),
+                           "%.1f" % delta if delta is not None else "n/a",
+                           rx_ewma, host))
+                    last_logged_rate = rate
+            elif clean and rate < CEIL_MBIT:
+                rate = min(CEIL_MBIT, rate + GROW_MBIT)
+                set_bw(rate)
+        elif idle and rate < BASE_MBIT and (t0 - loaded_last_t) > IDLE_REVERT_AFTER_S:
+            rate = min(BASE_MBIT, rate + IDLE_REVERT_STEP)
+            set_bw(rate)
+
+        if abs(rate - last_logged_rate) >= 100 or rate in (FLOOR_MBIT, CEIL_MBIT, BASE_MBIT) and rate != last_logged_rate:
+            log("rate=%d rx=%.0f loaded=%s" % (rate, rx_ewma, loaded))
+            last_logged_rate = rate
+
+        # -- telemetry (1 Hz when loaded or latency elevated, 0.1 Hz idle)
+        if loaded or (delta is not None and delta > RTT_LO_MS) \
+                or tick % TELEM_IDLE_EVERY == 0:
+            telem(rate, rx_ewma, rtt, host, delta, loaded)
+
+        # -- drift: someone (configctl shaper reload) reset the pipe
+        if t0 - last_drift_t > DRIFT_CHECK_S:
+            last_drift_t = t0
+            actual = pipe_bw_mbit()
+            if actual is not None and abs(actual - rate) > 5:
+                log("drift: pipe=%.0f mine=%d -> reasserting" % (actual, rate))
+                set_bw(rate)
+
+        # -- heartbeat + status
+        if t0 - last_heartbeat_t > HEARTBEAT_S:
+            last_heartbeat_t = t0
+            log("heartbeat rate=%d rx=%.0f baselines=%s"
+                % (rate, rx_ewma,
+                   {k: round(v, 1) for k, v in baselines.items()}))
+        if tick % 5 == 0:
+            try:
+                with open(STATUS + ".tmp", "w") as f:
+                    json.dump({"ts": now_iso(), "rate_mbit": int(rate),
+                               "rx_mbps": round(rx_ewma, 1),
+                               "loaded": loaded,
+                               "last_rtt_ms": rtt, "reflector": host,
+                               "delta_ms": round(delta, 1) if delta is not None else None,
+                               "baselines": {k: round(v, 1) for k, v in baselines.items()}}, f)
+                os.rename(STATUS + ".tmp", STATUS)
+            except OSError:
+                pass
+
+        time.sleep(max(0.0, TICK_S - (time.monotonic() - t0)))
+
+    log("shutdown: leaving rate=%d" % rate)
+
+
+if __name__ == "__main__":
+    main()
